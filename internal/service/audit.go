@@ -70,6 +70,12 @@ func (s *Service) AuditTrail(ctx context.Context, batchID int64) (map[string]any
 			result["delivery"] = delivery
 		}
 	}
+	if degs, err := s.ListDegradations(ctx, &batchID); err == nil && len(degs) > 0 {
+		result["degradations"] = degs
+	}
+	if destructions, err := s.ListDestructions(ctx, batchID); err == nil && len(destructions) > 0 {
+		result["destructions"] = destructions
+	}
 	// 门店与机构名称
 	var names struct {
 		Store   string `json:"store"`

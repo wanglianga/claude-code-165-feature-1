@@ -9,8 +9,9 @@ info:
     分站点发放并回执 → 受助点反馈。每个批次沉淀 来源/温控/交接/配送/发放 五类哈希链凭证，
     支撑监管抽查与品牌风险控制。
 
-    **异常场景**：门店临时售罄、超过可捐赠时限、冷链车迟到、机构爽约、箱号错扫、
-    过敏原缺失、受助点反馈变质、监管抽查。
+    **异常场景**：门店临时售罄、超过可捐赠时限、冷链车迟到（触发迟到降级：按生产时间/现场温度/
+    剩余配送距离逐箱判定，不可捐箱号报损、临界箱号加急，门店补销毁凭证、机构补实际送达时间，
+    批次 closed 闭环并调整公示数量）、机构爽约、箱号错扫、过敏原缺失、受助点反馈变质、监管抽查。
 
     **一致性设计**：
     - 同一批次重复预约：Redis 分布式锁 + 数据库部分唯一索引 + Idempotency-Key 三重防重；
@@ -28,6 +29,7 @@ tags:
   - name: reservations
   - name: handover
   - name: delivery
+  - name: degradation
   - name: exceptions
   - name: audit
   - name: admin
@@ -653,6 +655,194 @@ paths:
                 properties:
                   processed: { type: integer }
 
+  /api/v1/batches/{id}/degradation/assess:
+    post:
+      tags: [degradation]
+      summary: 冷链迟到降级评估（公益机构；按生产时间/现场温度/剩余配送距离逐箱判定）
+      description: |
+        机构冷链车辆晚到、部分蛋糕接近保质期边界时调用。
+        服务逐箱计算：在途时间=剩余距离/均速，送达后须保留 2h 安全发放窗口；
+        现场温度超冷链上限 6℃ 直接报损，每超 1℃ 折损 1h 保质期裕度。
+        判定结果：不可捐赠箱号转 written_off（报损），临界箱号生成加急发放提醒。
+        幂等：同批次存在未闭环降级单时重放返回首次结论。
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DegradationAssessRequest' }
+      responses:
+        '201':
+          description: 降级评估完成
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  degradation: { $ref: '#/components/schemas/Degradation' }
+                  idempotent_replay: { type: boolean }
+        '200':
+          description: 幂等重放，返回已有降级单
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  degradation: { $ref: '#/components/schemas/Degradation' }
+                  idempotent_replay: { type: boolean, example: true }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/batches/{id}/degradation/close:
+    post:
+      tags: [degradation]
+      summary: 降级闭环（参与方/监管；须销毁凭证齐全且送达时间已补录）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      responses:
+        '200':
+          description: 降级单闭环，批次转 closed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  degradation: { $ref: '#/components/schemas/Degradation' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/degradations:
+    get:
+      tags: [degradation]
+      summary: 降级单列表（可按批次过滤）
+      parameters:
+        - name: batch_id
+          in: query
+          required: false
+          schema: { type: integer }
+      responses:
+        '200':
+          description: 降级单列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  degradations:
+                    type: array
+                    items: { $ref: '#/components/schemas/Degradation' }
+
+  /api/v1/batches/{id}/destructions:
+    post:
+      tags: [degradation]
+      summary: 门店上传报损食品销毁照片或内部处理记录
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DestructionRequest' }
+      responses:
+        '201':
+          description: 销毁凭证已记录（满足闭环条件时批次自动闭环）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  destruction: { $ref: '#/components/schemas/DestructionRecord' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+    get:
+      tags: [degradation]
+      summary: 查询批次报损销毁/内部处理记录
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      responses:
+        '200':
+          description: 销毁记录列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  destructions:
+                    type: array
+                    items: { $ref: '#/components/schemas/DestructionRecord' }
+
+  /api/v1/distributions/{id}/actual-delivery:
+    post:
+      tags: [degradation]
+      summary: 接收方补录实际送达时间（降级后发放必填；补录后可自动闭环）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [actual_delivered_at]
+              properties:
+                actual_delivered_at: { type: string, format: date-time }
+      responses:
+        '200':
+          description: 已补录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  distribution: { $ref: '#/components/schemas/Distribution' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/notifications:
+    get:
+      tags: [degradation]
+      summary: 当前用户所属机构/门店的站内通知（箱号去向、加急提醒、待销毁）
+      parameters:
+        - name: unread_only
+          in: query
+          required: false
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: 通知列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notifications:
+                    type: array
+                    items: { $ref: '#/components/schemas/Notification' }
+
+  /api/v1/notifications/{id}/read:
+    post:
+      tags: [degradation]
+      summary: 标记通知已读
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: 已读
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  read: { type: boolean, example: true }
+        '404': { $ref: '#/components/responses/Error' }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -716,7 +906,7 @@ components:
           items: { type: string }
     BatchStatus:
       type: string
-      enum: [reported, reserved, confirmed, handover, handed_over, in_delivery, distributed, cancelled, expired]
+      enum: [reported, reserved, confirmed, handover, handed_over, in_delivery, distributed, closed, cancelled, expired]
     Batch:
       type: object
       properties:
@@ -745,7 +935,7 @@ components:
         box_no: { type: string }
         status:
           type: string
-          enum: [pending, scanned, handed_over, in_delivery, distributed, spoiled, missing]
+          enum: [pending, scanned, handed_over, in_delivery, distributed, spoiled, missing, written_off]
     ReportBatchRequest:
       type: object
       required: [category, total_boxes, produced_at, shelf_life_hours, latest_pickup_at]
@@ -873,6 +1063,7 @@ components:
         boxes: { type: integer }
         receiver_sign: { type: string }
         distributed_at: { type: string, format: date-time }
+        actual_delivered_at: { type: string, format: date-time, nullable: true }
         feedback_status: { type: string, enum: [none, ok, spoiled] }
         feedback_note: { type: string }
     Voucher:
@@ -882,7 +1073,7 @@ components:
         batch_id: { type: integer }
         type:
           type: string
-          enum: [source, reservation, confirmation, handover, delivery, distribution, exception, closure]
+          enum: [source, reservation, confirmation, handover, delivery, distribution, exception, degradation, destruction, closure]
         payload: { type: object, additionalProperties: true }
         hash: { type: string }
         prev_hash: { type: string }
@@ -896,7 +1087,7 @@ components:
         reservation_id: { type: integer }
         type:
           type: string
-          enum: [sold_out, expired, truck_late, no_show, wrong_scan, allergen_missing, spoilage_report, regulatory_check, capacity_rejected, temp_breach]
+          enum: [sold_out, expired, truck_late, no_show, wrong_scan, allergen_missing, spoilage_report, regulatory_check, capacity_rejected, temp_breach, cold_chain_degradation]
         detail: { type: object, additionalProperties: true }
         status: { type: string, enum: [open, resolved] }
         resolution: { type: string }
@@ -910,6 +1101,7 @@ components:
         category: { type: string }
         boxes: { type: integer }
         distributed_boxes: { type: integer }
+        written_off_boxes: { type: integer, description: 冷链迟到降级报损箱数（不计入捐赠数量） }
         recipient_summary:
           type: array
           items:
@@ -918,8 +1110,111 @@ components:
               recipient_type: { type: string }
               site_name: { type: string }
               boxes: { type: integer }
-        status: { type: string }
+        status:
+          type: string
+          enum: [distributed, adjusted, degraded_closed]
         published_at: { type: string, format: date-time }
+    DegradationAssessRequest:
+      type: object
+      required: [observed_temp_c, remaining_distance_km]
+      properties:
+        observed_temp_c: { type: number, example: 10.5, description: 默认现场实测温度（℃） }
+        box_temps:
+          type: object
+          additionalProperties: { type: number }
+          description: 逐箱实测温度覆盖（迟到现场逐箱测温）；未列出的箱用默认温度
+          example: { B20261005-00001-BOX-001: 6.0, B20261005-00001-BOX-002: 15.0 }
+        remaining_distance_km: { type: number, example: 20, description: 剩余配送距离（km） }
+        avg_speed_kmh: { type: number, example: 30, description: 预计车辆均速，缺省 30km/h }
+        late_minutes: { type: integer, example: 45 }
+        reason: { type: string, example: 高架拥堵晚到45分钟，部分蛋糕临近保质期 }
+    DegradationItem:
+      type: object
+      properties:
+        box_no: { type: string }
+        decision: { type: string, enum: [donate, urgent_donate, write_off] }
+        reason: { type: string, enum: [ok, urgent_shelf_boundary, shelf_life_insufficient, temp_hard_breach] }
+        remaining_shelf_hours: { type: number }
+        transit_hours: { type: number }
+        required_hours: { type: number }
+        effective_remaining_hours: { type: number }
+        temp_excess_c: { type: number }
+    Degradation:
+      type: object
+      properties:
+        id: { type: integer }
+        batch_id: { type: integer }
+        reservation_id: { type: integer }
+        exception_id: { type: integer }
+        observed_temp_c: { type: number }
+        remaining_distance_km: { type: number }
+        avg_speed_kmh: { type: number }
+        late_minutes: { type: integer }
+        reason: { type: string }
+        donatable_box_nos:
+          type: array
+          items: { type: string }
+        urgent_box_nos:
+          type: array
+          items: { type: string }
+        written_off_box_nos:
+          type: array
+          items: { type: string }
+        status: { type: string, enum: [assessed, closed] }
+        created_at: { type: string, format: date-time }
+        closed_at: { type: string, format: date-time, nullable: true }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DegradationItem' }
+    DestructionRequest:
+      type: object
+      required: [method, handler_name]
+      properties:
+        box_nos:
+          type: array
+          items: { type: string }
+          description: 报损箱号；缺省覆盖该降级单全部报损箱
+        method: { type: string, enum: [photo, internal] }
+        photo_urls:
+          type: array
+          items: { type: string }
+          description: method=photo 时至少一张销毁照片地址
+        internal_note: { type: string, description: method=internal 时必填的内部处理记录 }
+        handler_name: { type: string, example: 店长周九 }
+        witness_name: { type: string, example: 店员吴十 }
+        destroyed_at: { type: string, format: date-time }
+    DestructionRecord:
+      type: object
+      properties:
+        id: { type: integer }
+        batch_id: { type: integer }
+        store_id: { type: integer }
+        box_nos:
+          type: array
+          items: { type: string }
+        method: { type: string, enum: [photo, internal] }
+        photo_urls:
+          type: array
+          items: { type: string }
+        internal_note: { type: string }
+        handler_name: { type: string }
+        witness_name: { type: string }
+        destroyed_at: { type: string, format: date-time }
+        uploaded_by: { type: integer }
+        created_at: { type: string, format: date-time }
+    Notification:
+      type: object
+      properties:
+        id: { type: integer }
+        charity_id: { type: integer, nullable: true }
+        store_id: { type: integer, nullable: true }
+        batch_id: { type: integer }
+        category: { type: string, enum: [degradation_result, urgent_dispatch, destruction_due] }
+        title: { type: string }
+        content: { type: string }
+        payload: { type: object, additionalProperties: true }
+        is_read: { type: boolean }
+        created_at: { type: string, format: date-time }
 
 security:
   - bearerAuth: []

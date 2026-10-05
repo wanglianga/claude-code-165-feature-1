@@ -134,10 +134,11 @@ func (s *Service) SubmitDeliveryPlan(ctx context.Context, u *domain.User, resvID
 }
 
 // CompleteStop 完成一个配送站点的发放（幂等：站点唯一发放记录）。
+// 冷链迟到降级后允许实发 0 箱（该站点箱号已报损，仅标记站点关闭，不生成发放记录）。
 func (s *Service) CompleteStop(ctx context.Context, u *domain.User, stopID int64,
 	boxes int, receiverSign string) (*domain.Distribution, bool, error) {
-	if boxes <= 0 || receiverSign == "" {
-		return nil, false, domain.ErrBadRequest("发放箱数与签收人必填")
+	if receiverSign == "" {
+		return nil, false, domain.ErrBadRequest("签收人必填")
 	}
 	var dist *domain.Distribution
 	finished := false
@@ -166,17 +167,14 @@ func (s *Service) CompleteStop(ctx context.Context, u *domain.User, stopID int64
 			return err
 		}
 		if status == "completed" {
-			// 幂等：返回已存在的发放记录
+			// 幂等：返回已存在的发放记录（降级后 0 箱站点无发放记录，返回 nil）
 			d, derr := s.findDistributionByStop(ctx, tx, stopID)
-			if derr != nil {
+			if derr == nil {
+				dist = d
+			} else if !errors.Is(derr, pgx.ErrNoRows) {
 				return derr
 			}
-			dist = d
 			return nil
-		}
-		if int64(boxes) != plannedBoxes {
-			return domain.ErrUnprocessable(fmt.Sprintf(
-				"实发箱数 %d 与计划箱数 %d 不一致", boxes, plannedBoxes))
 		}
 		b, err := lockBatch(ctx, tx, r.BatchID)
 		if err != nil {
@@ -184,6 +182,30 @@ func (s *Service) CompleteStop(ctx context.Context, u *domain.User, stopID int64
 		}
 		if b.Status != domain.BatchInDelivery {
 			return domain.ErrConflict(fmt.Sprintf("批次状态为 %s，不可发放", b.Status))
+		}
+		// 冷链迟到降级后，报损箱不再配送，站点实发箱数允许少于原计划；
+		// 未降级时必须与计划箱数严格一致。
+		activeDeg, _ := s.getActiveDegradation(ctx, tx, r.BatchID)
+		if activeDeg == nil {
+			if int64(boxes) != plannedBoxes {
+				return domain.ErrUnprocessable(fmt.Sprintf(
+					"实发箱数 %d 与计划箱数 %d 不一致", boxes, plannedBoxes))
+			}
+		} else if int64(boxes) > plannedBoxes || int64(boxes) < 0 {
+			return domain.ErrUnprocessable(fmt.Sprintf(
+				"降级后实发箱数 %d 不能超过站点计划箱数 %d", boxes, plannedBoxes))
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE delivery_stops SET status='completed' WHERE id=$1`, stopID); err != nil {
+			return err
+		}
+		// 降级后该站点箱号全部报损：仅关闭站点，不生成发放/凭证，无需补录送达时间。
+		// 批次闭环仍须等待送达时间补录与销毁凭证（不在此标记 finished）。
+		if boxes == 0 {
+			if activeDeg == nil {
+				return domain.ErrUnprocessable("非降级批次不允许 0 箱发放")
+			}
+			return nil
 		}
 		var distID int64
 		err = tx.QueryRow(ctx, `
@@ -200,9 +222,14 @@ func (s *Service) CompleteStop(ctx context.Context, u *domain.User, stopID int64
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx,
-			`UPDATE delivery_stops SET status='completed' WHERE id=$1`, stopID); err != nil {
-			return err
+		// 降级批次：报损箱已剔除，按站点实发数量把在途箱逐箱翻转为已发放
+		if activeDeg != nil {
+			if _, err := tx.Exec(ctx, `
+				UPDATE boxes SET status=$1 WHERE id IN (
+				    SELECT id FROM boxes WHERE batch_id=$2 AND status=$3 ORDER BY id LIMIT $4)`,
+				domain.BoxDistributed, r.BatchID, domain.BoxInDelivery, boxes); err != nil {
+				return err
+			}
 		}
 		if err := insertVoucher(ctx, tx, b.ID, &resvID, domain.VoucherDistribution, map[string]any{
 			"distribution_id": distID, "stop_id": stopID, "site_name": siteName,
@@ -218,34 +245,51 @@ func (s *Service) CompleteStop(ctx context.Context, u *domain.User, stopID int64
 			return err
 		}
 		if remaining == 0 {
-			if _, err := tx.Exec(ctx,
-				`UPDATE boxes SET status=$1 WHERE batch_id=$2 AND status=$3`,
-				domain.BoxDistributed, b.ID, domain.BoxInDelivery); err != nil {
+			var actualTotal int
+			if err := tx.QueryRow(ctx,
+				`SELECT COALESCE(SUM(boxes),0) FROM distributions WHERE reservation_id=$1`, resvID).
+				Scan(&actualTotal); err != nil {
 				return err
 			}
-			if err := transitionBatch(ctx, tx, b.ID, domain.BatchInDelivery, domain.BatchDistributed); err != nil {
-				return err
-			}
-			if _, err := tx.Exec(ctx, `
-				UPDATE reservations SET status=$1, version=version+1, updated_at=now()
-				WHERE id=$2`, domain.ResvCompleted, resvID); err != nil {
-				return err
-			}
-			if err := insertVoucher(ctx, tx, b.ID, &resvID, domain.VoucherClosure, map[string]any{
-				"reservation_no": r.ReservationNo, "total_boxes": b.TotalBoxes,
-			}); err != nil {
-				return err
-			}
-			// 捐赠公示与发放同事务落库，保证库存/交接/公示一致
-			if err := s.projectPublicityTx(ctx, tx, b.ID); err != nil {
-				return err
+			if activeDeg != nil {
+				expected := b.TotalBoxes - len(activeDeg.WrittenOffBoxNos)
+				if actualTotal != expected {
+					return domain.ErrUnprocessable(fmt.Sprintf(
+						"降级后实发总箱数 %d 与可捐赠箱数 %d（交接 %d - 报损 %d）不一致",
+						actualTotal, expected, b.TotalBoxes, len(activeDeg.WrittenOffBoxNos)))
+				}
+				// 降级批次：不自动闭环；须补录实际送达时间 + 报损销毁凭证齐全后显式闭环为 closed。
+			} else {
+				if _, err := tx.Exec(ctx,
+					`UPDATE boxes SET status=$1 WHERE batch_id=$2 AND status=$3`,
+					domain.BoxDistributed, b.ID, domain.BoxInDelivery); err != nil {
+					return err
+				}
+				if err := transitionBatch(ctx, tx, b.ID, domain.BatchInDelivery, domain.BatchDistributed); err != nil {
+					return err
+				}
+				if _, err := tx.Exec(ctx, `
+					UPDATE reservations SET status=$1, version=version+1, updated_at=now()
+					WHERE id=$2`, domain.ResvCompleted, resvID); err != nil {
+					return err
+				}
+				if err := insertVoucher(ctx, tx, b.ID, &resvID, domain.VoucherClosure, map[string]any{
+					"reservation_no": r.ReservationNo, "total_boxes": b.TotalBoxes,
+				}); err != nil {
+					return err
+				}
+				// 捐赠公示与发放同事务落库，保证库存/交接/公示一致
+				if err := s.projectPublicityTx(ctx, tx, b.ID); err != nil {
+					return err
+				}
+				finished = true
 			}
 			if err := insertOutbox(ctx, tx, s.Cfg.KafkaTopic, fmt.Sprintf("batch:%d", b.ID), "batch.distributed", map[string]any{
-				"batch_id": b.ID, "reservation_id": resvID, "boxes": b.TotalBoxes,
+				"batch_id": b.ID, "reservation_id": resvID, "boxes": actualTotal,
+				"degraded": activeDeg != nil,
 			}); err != nil {
 				return err
 			}
-			finished = true
 		}
 		dist, err = s.findDistributionByStop(ctx, tx, stopID)
 		return err
@@ -257,10 +301,10 @@ func (s *Service) findDistributionByStop(ctx context.Context, q txQuerier, stopI
 	d := &domain.Distribution{}
 	err := q.QueryRow(ctx, `
 		SELECT id, stop_id, reservation_id, boxes, receiver_sign, distributed_at,
-		       feedback_status, feedback_note, feedback_at
+		       actual_delivered_at, feedback_status, feedback_note, feedback_at
 		FROM distributions WHERE stop_id=$1`, stopID).Scan(
 		&d.ID, &d.StopID, &d.ReservationID, &d.Boxes, &d.ReceiverSign, &d.DistributedAt,
-		&d.FeedbackStatus, &d.FeedbackNote, &d.FeedbackAt)
+		&d.ActualDeliveredAt, &d.FeedbackStatus, &d.FeedbackNote, &d.FeedbackAt)
 	return d, err
 }
 
@@ -361,7 +405,7 @@ func (s *Service) GetDeliveryDetail(ctx context.Context, resvID int64) (map[stri
 	if len(stopIDs) > 0 {
 		drows, err := s.DB.Query(ctx, `
 			SELECT id, stop_id, reservation_id, boxes, receiver_sign, distributed_at,
-			       feedback_status, feedback_note, feedback_at
+			       actual_delivered_at, feedback_status, feedback_note, feedback_at
 			FROM distributions WHERE stop_id = ANY($1) ORDER BY id`, stopIDs)
 		if err != nil {
 			return nil, err
@@ -370,7 +414,7 @@ func (s *Service) GetDeliveryDetail(ctx context.Context, resvID int64) (map[stri
 		for drows.Next() {
 			var d domain.Distribution
 			if err := drows.Scan(&d.ID, &d.StopID, &d.ReservationID, &d.Boxes, &d.ReceiverSign,
-				&d.DistributedAt, &d.FeedbackStatus, &d.FeedbackNote, &d.FeedbackAt); err != nil {
+				&d.DistributedAt, &d.ActualDeliveredAt, &d.FeedbackStatus, &d.FeedbackNote, &d.FeedbackAt); err != nil {
 				return nil, err
 			}
 			dists = append(dists, d)

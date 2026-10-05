@@ -377,7 +377,7 @@ func (h *Handler) SubmitDeliveryPlan(c *gin.Context) {
 }
 
 type completeStopReq struct {
-	Boxes        int    `json:"boxes" binding:"required"`
+	Boxes        int    `json:"boxes"`
 	ReceiverSign string `json:"receiver_sign" binding:"required"`
 }
 
@@ -388,7 +388,7 @@ func (h *Handler) CompleteStop(c *gin.Context) {
 	}
 	var req completeStopReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		writeError(c, domain.ErrBadRequest("boxes 与 receiver_sign 必填"))
+		writeError(c, domain.ErrBadRequest("receiver_sign 必填"))
 		return
 	}
 	dist, finished, err := h.svc.CompleteStop(c.Request.Context(), currentUser(c), id, req.Boxes, req.ReceiverSign)
@@ -495,6 +495,160 @@ func (h *Handler) ListExceptions(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"exceptions": list})
+}
+
+// ---------- 冷链迟到降级 ----------
+
+type assessDegradationReq struct {
+	ObservedTempC       float64            `json:"observed_temp_c"`
+	BoxTemps            map[string]float64 `json:"box_temps"`
+	RemainingDistanceKm float64            `json:"remaining_distance_km"`
+	AvgSpeedKmh         float64            `json:"avg_speed_kmh"`
+	LateMinutes         int                `json:"late_minutes"`
+	Reason              string             `json:"reason"`
+}
+
+func (h *Handler) AssessDegradation(c *gin.Context) {
+	id, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	var req assessDegradationReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, domain.ErrBadRequest("请求体非法: "+err.Error()))
+		return
+	}
+	deg, idempotent, err := h.svc.AssessDegradation(c.Request.Context(), currentUser(c), id, service.DegradeInput{
+		ObservedTempC: req.ObservedTempC, BoxTemps: req.BoxTemps,
+		RemainingDistanceKm: req.RemainingDistanceKm,
+		AvgSpeedKmh:         req.AvgSpeedKmh, LateMinutes: req.LateMinutes, Reason: req.Reason,
+	})
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	status := 201
+	if idempotent {
+		status = 200
+	}
+	c.JSON(status, gin.H{"degradation": deg, "idempotent_replay": idempotent})
+}
+
+func (h *Handler) ListDegradations(c *gin.Context) {
+	var batchID *int64
+	if s := c.Query("batch_id"); s != "" {
+		if id, err := strconv.ParseInt(s, 10, 64); err == nil {
+			batchID = &id
+		}
+	}
+	list, err := h.svc.ListDegradations(c.Request.Context(), batchID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"degradations": list})
+}
+
+func (h *Handler) CloseDegradation(c *gin.Context) {
+	id, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	deg, err := h.svc.CloseDegradation(c.Request.Context(), currentUser(c), id)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"degradation": deg})
+}
+
+type actualDeliveryReq struct {
+	ActualDeliveredAt time.Time `json:"actual_delivered_at" binding:"required"`
+}
+
+func (h *Handler) SubmitActualDelivery(c *gin.Context) {
+	id, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	var req actualDeliveryReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, domain.ErrBadRequest("actual_delivered_at 必填(RFC3339)"))
+		return
+	}
+	dist, err := h.svc.SubmitActualDelivery(c.Request.Context(), currentUser(c), id, req.ActualDeliveredAt)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"distribution": dist})
+}
+
+type destructionReq struct {
+	BoxNos       []string  `json:"box_nos"`
+	Method       string    `json:"method" binding:"required"`
+	PhotoURLs    []string  `json:"photo_urls"`
+	InternalNote string    `json:"internal_note"`
+	HandlerName  string    `json:"handler_name" binding:"required"`
+	WitnessName  string    `json:"witness_name"`
+	DestroyedAt  time.Time `json:"destroyed_at"`
+}
+
+func (h *Handler) SubmitDestruction(c *gin.Context) {
+	id, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	var req destructionReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, domain.ErrBadRequest("请求体非法: "+err.Error()))
+		return
+	}
+	rec, err := h.svc.SubmitDestruction(c.Request.Context(), currentUser(c), id, service.DestructionInput{
+		BoxNos: req.BoxNos, Method: req.Method, PhotoURLs: req.PhotoURLs,
+		InternalNote: req.InternalNote, HandlerName: req.HandlerName,
+		WitnessName: req.WitnessName, DestroyedAt: req.DestroyedAt,
+	})
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(201, gin.H{"destruction": rec})
+}
+
+func (h *Handler) ListDestructions(c *gin.Context) {
+	id, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	list, err := h.svc.ListDestructions(c.Request.Context(), id)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"destructions": list})
+}
+
+func (h *Handler) ListNotifications(c *gin.Context) {
+	list, err := h.svc.ListNotifications(c.Request.Context(), currentUser(c),
+		c.Query("unread_only") == "true")
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"notifications": list})
+}
+
+func (h *Handler) ReadNotification(c *gin.Context) {
+	id, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	if err := h.svc.MarkNotificationRead(c.Request.Context(), currentUser(c), id); err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"read": true})
 }
 
 // ---------- 凭证 / 审计 / 公示 ----------

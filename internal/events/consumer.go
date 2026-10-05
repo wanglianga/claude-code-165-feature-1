@@ -37,7 +37,9 @@ func StartConsumer(ctx context.Context, svc *service.Service, brokers []string, 
 			continue
 		}
 		log.Printf("[consumer] event=%s key=%s", ev.Event, string(msg.Key))
-		if ev.Event == "batch.distributed" {
+		// 发放完成、冷链迟到降级评估/闭环均需（重新）投影捐赠公示数量
+		if ev.Event == "batch.distributed" || ev.Event == "degradation.assessed" ||
+			ev.Event == "degradation.closed" {
 			var data struct {
 				BatchID int64 `json:"batch_id"`
 			}
@@ -45,7 +47,7 @@ func StartConsumer(ctx context.Context, svc *service.Service, brokers []string, 
 				if err := svc.ProjectPublicity(ctx, data.BatchID); err != nil {
 					log.Printf("[consumer] project publicity batch=%d: %v", data.BatchID, err)
 				} else {
-					log.Printf("[consumer] publicity projected batch=%d", data.BatchID)
+					log.Printf("[consumer] publicity projected batch=%d event=%s", data.BatchID, ev.Event)
 				}
 			}
 		}

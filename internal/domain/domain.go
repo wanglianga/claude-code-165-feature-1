@@ -52,6 +52,7 @@ const (
 	BatchHandedOver  = "handed_over" // 交接完成，待配送计划
 	BatchInDelivery  = "in_delivery" // 配送中
 	BatchDistributed = "distributed" // 全部发放完成
+	BatchClosed      = "closed"      // 冷链迟到降级后闭环（部分发放+部分报损销毁）
 	BatchCancelled   = "cancelled"   // 已取消（如临时售罄）
 	BatchExpired     = "expired"     // 超过可捐赠时限
 )
@@ -64,7 +65,8 @@ var batchTransitions = map[string][]string{
 	BatchHandover:    {BatchHandedOver, BatchCancelled, BatchExpired},
 	BatchHandedOver:  {BatchInDelivery},
 	BatchInDelivery:  {BatchDistributed},
-	BatchDistributed: {},
+	BatchDistributed: {BatchClosed},
+	BatchClosed:      {},
 	BatchCancelled:   {},
 	BatchExpired:     {},
 }
@@ -98,21 +100,23 @@ const (
 	BoxInDelivery  = "in_delivery"
 	BoxDistributed = "distributed"
 	BoxSpoiled     = "spoiled"
+	BoxWrittenOff  = "written_off" // 冷链迟到降级后判定不可捐赠，转报损
 )
 
 // ---------- 异常类型 ----------
 
 const (
-	ExSoldOut          = "sold_out"          // 门店临时售罄
-	ExExpired          = "expired"           // 超过可捐赠时限
-	ExTruckLate        = "truck_late"        // 冷链车迟到
-	ExNoShow           = "no_show"           // 公益机构爽约
-	ExWrongScan        = "wrong_scan"        // 箱号错扫
-	ExAllergenMissing  = "allergen_missing"  // 过敏原信息缺失
-	ExSpoilageReport   = "spoilage_report"   // 受助点反馈变质
-	ExRegulatoryCheck  = "regulatory_check"  // 监管抽查
-	ExCapacityRejected = "capacity_rejected" // 接收能力不足被拒
-	ExTempBreach       = "temp_breach"       // 温度超标
+	ExSoldOut           = "sold_out"               // 门店临时售罄
+	ExExpired           = "expired"                // 超过可捐赠时限
+	ExTruckLate         = "truck_late"             // 冷链车迟到
+	ExNoShow            = "no_show"                // 公益机构爽约
+	ExWrongScan         = "wrong_scan"             // 箱号错扫
+	ExAllergenMissing   = "allergen_missing"       // 过敏原信息缺失
+	ExSpoilageReport    = "spoilage_report"        // 受助点反馈变质
+	ExRegulatoryCheck   = "regulatory_check"       // 监管抽查
+	ExCapacityRejected  = "capacity_rejected"      // 接收能力不足被拒
+	ExTempBreach        = "temp_breach"            // 温度超标
+	ExColdChainDegraded = "cold_chain_degradation" // 冷链迟到降级（部分报损/加急发放）
 )
 
 // ---------- 凭证类型 ----------
@@ -125,6 +129,8 @@ const (
 	VoucherDelivery     = "delivery"     // 配送凭证
 	VoucherDistribution = "distribution" // 发放凭证
 	VoucherException    = "exception"    // 异常凭证
+	VoucherDegradation  = "degradation"  // 冷链迟到降级凭证（箱级判定结果）
+	VoucherDestruction  = "destruction"  // 报损食品销毁凭证
 	VoucherClosure      = "closure"      // 闭环凭证
 )
 
@@ -272,15 +278,16 @@ type DeliveryStop struct {
 }
 
 type Distribution struct {
-	ID             int64      `json:"id"`
-	StopID         int64      `json:"stop_id"`
-	ReservationID  int64      `json:"reservation_id"`
-	Boxes          int        `json:"boxes"`
-	ReceiverSign   string     `json:"receiver_sign"`
-	DistributedAt  time.Time  `json:"distributed_at"`
-	FeedbackStatus string     `json:"feedback_status"`
-	FeedbackNote   string     `json:"feedback_note,omitempty"`
-	FeedbackAt     *time.Time `json:"feedback_at,omitempty"`
+	ID                int64      `json:"id"`
+	StopID            int64      `json:"stop_id"`
+	ReservationID     int64      `json:"reservation_id"`
+	Boxes             int        `json:"boxes"`
+	ReceiverSign      string     `json:"receiver_sign"`
+	DistributedAt     time.Time  `json:"distributed_at"`
+	ActualDeliveredAt *time.Time `json:"actual_delivered_at,omitempty"` // 接收方补录的实际送达时间（降级后必填）
+	FeedbackStatus    string     `json:"feedback_status"`
+	FeedbackNote      string     `json:"feedback_note,omitempty"`
+	FeedbackAt        *time.Time `json:"feedback_at,omitempty"`
 }
 
 type Voucher struct {
@@ -317,6 +324,7 @@ type Publicity struct {
 	Category         string         `json:"category"`
 	Boxes            int            `json:"boxes"`
 	DistributedBoxes int            `json:"distributed_boxes"`
+	WrittenOffBoxes  int            `json:"written_off_boxes"` // 冷链迟到降级转报损箱数（不计入捐赠公示数量）
 	RecipientSummary []RecipientSum `json:"recipient_summary"`
 	Status           string         `json:"status"`
 	PublishedAt      time.Time      `json:"published_at"`
@@ -326,4 +334,71 @@ type RecipientSum struct {
 	RecipientType string `json:"recipient_type"`
 	SiteName      string `json:"site_name"`
 	Boxes         int    `json:"boxes"`
+}
+
+// ---------- 冷链迟到降级 ----------
+
+type Degradation struct {
+	ID                  int64             `json:"id"`
+	BatchID             int64             `json:"batch_id"`
+	ReservationID       int64             `json:"reservation_id"`
+	ExceptionID         int64             `json:"exception_id"`
+	TriggeredBy         *int64            `json:"triggered_by,omitempty"`
+	ObservedTempC       float64           `json:"observed_temp_c"`
+	RemainingDistanceKm float64           `json:"remaining_distance_km"`
+	AvgSpeedKmh         float64           `json:"avg_speed_kmh"`
+	LateMinutes         int               `json:"late_minutes"`
+	Reason              string            `json:"reason"`
+	DonatableBoxNos     []string          `json:"donatable_box_nos"`
+	UrgentBoxNos        []string          `json:"urgent_box_nos"`
+	WrittenOffBoxNos    []string          `json:"written_off_box_nos"`
+	Status              string            `json:"status"` // assessed / closed
+	CreatedAt           time.Time         `json:"created_at"`
+	ClosedAt            *time.Time        `json:"closed_at,omitempty"`
+	Items               []DegradationItem `json:"items,omitempty"`
+}
+
+type DegradationItem struct {
+	ID                      int64     `json:"id"`
+	DegradationID           int64     `json:"degradation_id"`
+	BoxNo                   string    `json:"box_no"`
+	Decision                string    `json:"decision"` // donate / urgent_donate / write_off
+	Reason                  string    `json:"reason"`
+	RemainingShelfHours     float64   `json:"remaining_shelf_hours"`
+	TransitHours            float64   `json:"transit_hours"`
+	RequiredHours           float64   `json:"required_hours"`
+	EffectiveRemainingHours float64   `json:"effective_remaining_hours"`
+	TempExcessC             float64   `json:"temp_excess_c"`
+	CreatedAt               time.Time `json:"created_at"`
+}
+
+// DestructionRecord 报损食品销毁/内部处理凭证（门店上传，监管可查）。
+type DestructionRecord struct {
+	ID           int64     `json:"id"`
+	BatchID      int64     `json:"batch_id"`
+	StoreID      int64     `json:"store_id"`
+	BoxNos       []string  `json:"box_nos"`
+	Method       string    `json:"method"` // photo（销毁照片）/ internal（内部处理记录）
+	PhotoURLs    []string  `json:"photo_urls"`
+	InternalNote string    `json:"internal_note"`
+	HandlerName  string    `json:"handler_name"`
+	WitnessName  string    `json:"witness_name"`
+	DestroyedAt  time.Time `json:"destroyed_at"`
+	UploadedBy   int64     `json:"uploaded_by"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// AppNotification 站内通知：降级后告知参与机构箱号去向（可接收/已报损/加急）。
+type AppNotification struct {
+	ID        int64          `json:"id"`
+	UserID    *int64         `json:"user_id,omitempty"`
+	CharityID *int64         `json:"charity_id,omitempty"`
+	StoreID   *int64         `json:"store_id,omitempty"`
+	BatchID   int64          `json:"batch_id"`
+	Category  string         `json:"category"` // degradation_result / urgent_dispatch / destruction_due
+	Title     string         `json:"title"`
+	Content   string         `json:"content"`
+	Payload   map[string]any `json:"payload,omitempty"`
+	IsRead    bool           `json:"is_read"`
+	CreatedAt time.Time      `json:"created_at"`
 }

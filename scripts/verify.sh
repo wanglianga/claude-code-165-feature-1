@@ -286,6 +286,142 @@ expect_code 201 "监管抽查留痕"
 req GET "/api/v1/exceptions?batch_id=$BATCH_A" "$REG"
 assert_jq "存在 regulatory_check 记录" '[.exceptions[] | select(.type=="regulatory_check")] | length == 1'
 
+
+echo "== 12. 冷链迟到降级（部分报损+加急+销毁凭证+公示调整+闭环） =="
+# 批次E：4 箱冷链蛋糕，保质期 36h，评估时已生产约 28h（剩余约 8h）
+BODY_E=$(jq -n --arg produced "$(iso $((NOW-28*3600)))" --arg pickup "$(iso $((NOW+6*3600)))" '{
+  category:"奶油蛋糕", total_boxes:4, produced_at:$produced, shelf_life_hours:36,
+  allergens:["egg","milk"], allergen_confirmed:true, requires_cold_chain:true,
+  storage_temp_max_c:8, packaging:"intact", lat:31.2243, lng:121.4243,
+  latest_pickup_at:$pickup}')
+req POST "/api/v1/stores/$STORE1/batches" "$STORE_STAFF" "$BODY_E"
+expect_code 201 "上报冷链批次E"
+BATCH_E=$(echo "$RESP" | jq -r '.batch.id')
+BATCH_E_NO=$(echo "$RESP" | jq -r '.batch.batch_no')
+EBOX1=$(echo "$RESP" | jq -r '.boxes[0].box_no')
+EBOX2=$(echo "$RESP" | jq -r '.boxes[1].box_no')
+EBOX3=$(echo "$RESP" | jq -r '.boxes[2].box_no')
+EBOX4=$(echo "$RESP" | jq -r '.boxes[3].box_no')
+req POST "/api/v1/batches/$BATCH_E/reserve" "$CH1" \
+  "{\"charity_id\":$CH1_ID,\"boxes\":4,\"planned_pickup_at\":\"$PICKUP_PLAN\",\"cold_chain\":true,
+    \"vehicle_plate\":\"沪冷002\",\"driver_name\":\"钱七\",\"receiver_name\":\"孙八\",\"receiver_id_no\":\"ID3101051988\"}" \
+  "Idempotency-Key: rk-e-$NOW"
+expect_code 201 "机构1预约批次E"
+RESV_E=$(echo "$RESP" | jq -r '.reservation.id')
+req POST "/api/v1/reservations/$RESV_E/confirm" "$STORE_MGR"
+expect_code 200 "确认批次E预约"
+req POST "/api/v1/reservations/$RESV_E/handover/start" "$STORE_STAFF"
+expect_code 201 "批次E开始交接"
+for bx in "$EBOX1" "$EBOX2" "$EBOX3" "$EBOX4"; do
+  req POST "/api/v1/reservations/$RESV_E/handover/scan" "$STORE_STAFF" \
+    "{\"box_no\":\"$bx\",\"temp_c\":5.0,\"seal_intact\":true}"
+done
+req POST "/api/v1/reservations/$RESV_E/handover/complete" "$STORE_STAFF" \
+  '{"receiver_name":"孙八","receiver_id_no":"ID3101051988","overall_temp_c":6.0,"seal_intact":true}'
+expect_code 200 "批次E完成交接"
+# 配送计划：站点1 3箱、站点2 1箱
+req POST "/api/v1/reservations/$RESV_E/delivery-plan" "$CH1" \
+  '{"vehicle_plate":"沪冷002","driver_name":"钱七","cold_chain":true,
+    "stops":[{"seq":1,"recipient_type":"community_kitchen","site_name":"江苏社区食堂","planned_boxes":3},
+             {"seq":2,"recipient_type":"shelter","site_name":"虹桥救助站","planned_boxes":1}]}'
+expect_code 201 "批次E提交配送计划"
+ESTOP1=$(echo "$RESP" | jq -r '.stops[0].id')
+ESTOP2=$(echo "$RESP" | jq -r '.stops[1].id')
+# 机构上报 truck_late 后执行降级评估：箱1正常、箱2硬脱冷报损、箱3/4临界加急
+req POST "/api/v1/batches/$BATCH_E/exceptions" "$CH1" \
+  '{"type":"truck_late","detail":{"eta_minutes":45,"reason":"晚高峰高架拥堵"}}'
+expect_code 201 "机构上报冷链车迟到(truck_late)"
+DEG_BODY=$(jq -n --arg b1 "$EBOX1" --arg b2 "$EBOX2" --arg b3 "$EBOX3" --arg b4 "$EBOX4" '{
+  observed_temp_c:6, remaining_distance_km:15, avg_speed_kmh:30, late_minutes:45,
+  reason:"晚到45分钟，逐箱测温评估",
+  box_temps:{($b1):6,($b2):15,($b3):12,($b4):12}}')
+req POST "/api/v1/batches/$BATCH_E/degradation/assess" "$CH1" "$DEG_BODY"
+expect_code 201 "执行冷链迟到降级评估"
+assert_jq "1箱转报损(硬脱冷)" ".degradation.written_off_box_nos == [\"$EBOX2\"]"
+assert_jq "2箱加急(保质期边界)" ".degradation.urgent_box_nos | sort == [\"$EBOX3\",\"$EBOX4\"]"
+assert_jq "3箱仍可接收" ".degradation.donatable_box_nos | sort == [\"$EBOX1\",\"$EBOX3\",\"$EBOX4\"]"
+assert_jq "箱级判定含4条明细" '.degradation.items | length == 4'
+assert_jq "箱2判定 temp_hard_breach" ".degradation.items[] | select(.box_no==\"$EBOX2\") | .decision == \"write_off\" and .reason == \"temp_hard_breach\""
+assert_jq "箱3判定 urgent_donate" ".degradation.items[] | select(.box_no==\"$EBOX3\") | .decision == \"urgent_donate\""
+assert_jq "箱1判定 donate" ".degradation.items[] | select(.box_no==\"$EBOX1\") | .decision == \"donate\""
+# 幂等重放
+req POST "/api/v1/batches/$BATCH_E/degradation/assess" "$CH1" "$DEG_BODY"
+expect_code 200 "降级评估重复调用幂等返回"
+assert_jq "幂等标记" '.idempotent_replay == true'
+# 权限：门店不可评估
+req POST "/api/v1/batches/$BATCH_E/degradation/assess" "$STORE_STAFF" "$DEG_BODY"
+expect_code 403 "门店账号不能执行降级评估"
+# 箱状态、异常与凭证
+req GET "/api/v1/batches/$BATCH_E" "$REG"
+assert_jq "箱2已标记 written_off" '[.boxes[] | select(.status=="written_off")] | length == 1'
+assert_jq "批次仍处配送中(未闭环)" '.batch.status == "in_delivery"'
+req GET "/api/v1/exceptions?batch_id=$BATCH_E" "$REG"
+assert_jq "产生 cold_chain_degradation 异常" '[.exceptions[] | select(.type=="cold_chain_degradation")] | length == 1'
+req GET "/api/v1/batches/$BATCH_E/vouchers" "$STORE_STAFF"
+assert_jq "降级凭证入哈希链且链有效" '.chain_valid == true and ([.vouchers[] | select(.type=="degradation")] | length == 1)'
+# 通知：机构收到箱号去向+加急；门店收到待销毁
+req GET /api/v1/notifications "$CH1"
+assert_jq "机构收到降级结果通知" '[.notifications[] | select(.category=="degradation_result")] | length >= 1'
+assert_jq "机构收到加急发放提醒" '[.notifications[] | select(.category=="urgent_dispatch")] | length == 1'
+req GET /api/v1/notifications "$STORE_STAFF"
+assert_jq "门店收到报损待销毁通知" '[.notifications[] | select(.category=="destruction_due")] | length == 1'
+# 公示即时调整：报损箱剔除
+req GET /api/v1/publicity/donations
+assert_jq "公示已剔除报损箱(written_off=1)" "[.donations[] | select(.batch_no==\"$BATCH_E_NO\")][0] | .written_off_boxes == 1"
+assert_jq "公示状态 adjusted(闭环前)" "[.donations[] | select(.batch_no==\"$BATCH_E_NO\")][0] | .status == \"adjusted\""
+# 降级后按调整后箱数发放：站点1 发 3 箱，站点2 箱已报损按 0 箱关闭
+req POST "/api/v1/delivery-stops/$ESTOP1/complete" "$CH1" '{"boxes":3,"receiver_sign":"周九"}'
+expect_code 200 "站点1按可捐赠箱数发放3箱"
+EDIST1=$(echo "$RESP" | jq -r '.distribution.id')
+req POST "/api/v1/delivery-stops/$ESTOP2/complete" "$CH1" '{"boxes":0,"receiver_sign":"站点箱已报损,站长确认"}'
+expect_code 200 "站点2箱已报损按0箱关闭"
+req GET "/api/v1/batches/$BATCH_E" "$REG"
+assert_jq "全部站点完成但批次未闭环" '.batch.status == "in_delivery"'
+# 证据不全禁止闭环
+req POST "/api/v1/batches/$BATCH_E/degradation/close" "$CH1"
+expect_code 422 "缺送达时间与销毁凭证时闭环被拒"
+# 报损凭证校验
+req POST "/api/v1/batches/$BATCH_E/destructions" "$STORE_STAFF" \
+  "{\"box_nos\":[\"$EBOX2\"],\"method\":\"photo\",\"photo_urls\":[],\"handler_name\":\"店长吴十\"}"
+expect_code 400 "照片方式未传照片被拒"
+req POST "/api/v1/batches/$BATCH_E/destructions" "$STORE_STAFF" \
+  "{\"box_nos\":[\"$EBOX1\"],\"method\":\"internal\",\"internal_note\":\"x\",\"handler_name\":\"店长吴十\"}"
+expect_code 422 "对非报损箱上传销毁凭证被拒"
+# 补录实际送达时间：仅送达时间仍缺销毁，不闭环
+req POST "/api/v1/distributions/$EDIST1/actual-delivery" "$CH1" \
+  "{\"actual_delivered_at\":\"$(iso $NOW)\"}"
+expect_code 200 "接收方补录实际送达时间"
+req GET "/api/v1/batches/$BATCH_E" "$REG"
+assert_jq "送达时间已补录但批次仍未闭环" '.batch.status == "in_delivery"'
+# 门店上传内部处理记录 -> 凭证齐全自动闭环
+req POST "/api/v1/batches/$BATCH_E/destructions" "$STORE_STAFF" \
+  "{\"box_nos\":[\"$EBOX2\"],\"method\":\"internal\",\"internal_note\":\"报损蛋糕按餐厨废弃物规范处理,留存监控录像\",\"handler_name\":\"店长吴十\",\"witness_name\":\"店员郑十一\"}"
+expect_code 201 "门店上传报损内部处理记录"
+req GET "/api/v1/batches/$BATCH_E" "$REG"
+assert_jq "证据齐全批次自动闭环(closed)" '.batch.status == "closed"'
+assert_jq "预约已完成" '.reservation.status == "completed"'
+assert_jq "3箱已发放1箱报损" '[.boxes[] | select(.status=="distributed")] | length == 3'
+# 重复销毁拒绝
+req POST "/api/v1/batches/$BATCH_E/destructions" "$STORE_STAFF" \
+  "{\"box_nos\":[\"$EBOX2\"],\"method\":\"internal\",\"internal_note\":\"重复处理\",\"handler_name\":\"店长吴十\"}"
+expect_code 409 "已销毁箱号禁止重复上传凭证"
+# 凭证链/公示/审计
+req GET "/api/v1/batches/$BATCH_E/vouchers" "$STORE_STAFF"
+assert_jq "含销毁凭证" '[.vouchers[] | select(.type=="destruction")] | length == 1'
+assert_jq "含降级闭环凭证" '[.vouchers[] | select(.type=="closure")] | length == 1'
+assert_jq "闭环后哈希链仍有效" '.chain_valid == true'
+req GET /api/v1/publicity/donations
+assert_jq "闭环公示发放箱数=3" "[.donations[] | select(.batch_no==\"$BATCH_E_NO\")][0] | .distributed_boxes == 3"
+assert_jq "闭环公示报损箱数=1" "[.donations[] | select(.batch_no==\"$BATCH_E_NO\")][0] | .written_off_boxes == 1"
+assert_jq "公示状态 degraded_closed" "[.donations[] | select(.batch_no==\"$BATCH_E_NO\")][0] | .status == \"degraded_closed\""
+req GET "/api/v1/batches/$BATCH_E/audit" "$REG"
+expect_code 200 "监管审计降级批次"
+assert_jq "审计轨迹含降级单" '[.degradations[]] | length >= 1'
+assert_jq "审计轨迹含销毁记录" '[.destructions[]] | length >= 1'
+assert_jq "审计哈希链有效" '.chain_valid == true'
+req POST "/api/v1/batches/$BATCH_E/degradation/close" "$CH1"
+expect_code 404 "已闭环降级单不可重复关闭"
+
 echo ""
 echo "==================================="
 echo "验证结果: PASS=$PASS FAIL=$FAIL"
