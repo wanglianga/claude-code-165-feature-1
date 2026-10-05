@@ -20,17 +20,19 @@ func bytesToMap(b []byte) map[string]any {
 func (s *Service) projectPublicityTx(ctx context.Context, tx txQuerier, batchID int64) error {
 	var (
 		batchNo, storeName, charityName, category string
-		boxes                                     int
+		boxes, writtenOff                         int
 	)
 	err := tx.QueryRow(ctx, `
-		SELECT b.batch_no, st.name, ch.name, b.category, b.total_boxes
+		SELECT b.batch_no, st.name, ch.name, b.category,
+		       b.total_boxes - COALESCE((SELECT COUNT(*) FROM boxes bx WHERE bx.batch_id=b.id AND bx.status='written_off'),0),
+		       COALESCE((SELECT COUNT(*) FROM boxes bx WHERE bx.batch_id=b.id AND bx.status='written_off'),0)
 		FROM batches b
 		JOIN stores st ON st.id = b.store_id
 		JOIN reservations r ON r.batch_id = b.id AND r.status='completed'
 		JOIN charities ch ON ch.id = r.charity_id
 		WHERE b.id=$1
 		ORDER BY r.id DESC LIMIT 1`, batchID).
-		Scan(&batchNo, &storeName, &charityName, &category, &boxes)
+		Scan(&batchNo, &storeName, &charityName, &category, &boxes, &writtenOff)
 	if err != nil {
 		return err
 	}
@@ -58,13 +60,14 @@ func (s *Service) projectPublicityTx(ctx context.Context, tx txQuerier, batchID 
 	summaryJSON, _ := json.Marshal(summary)
 	_, err = tx.Exec(ctx, `
 		INSERT INTO publicity(batch_id, batch_no, store_name, charity_name, category, boxes,
-		    distributed_boxes, recipient_summary, status, published_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,'distributed', now())
+		    distributed_boxes, written_off_boxes, recipient_summary, status, published_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'distributed', now())
 		ON CONFLICT (batch_id) DO UPDATE SET
 		    distributed_boxes=EXCLUDED.distributed_boxes,
+		    written_off_boxes=EXCLUDED.written_off_boxes,
 		    recipient_summary=EXCLUDED.recipient_summary,
 		    status=EXCLUDED.status, published_at=now()`,
-		batchID, batchNo, storeName, charityName, category, boxes, distributed, summaryJSON)
+		batchID, batchNo, storeName, charityName, category, boxes, distributed, writtenOff, summaryJSON)
 	return err
 }
 
@@ -77,7 +80,7 @@ func (s *Service) ProjectPublicity(ctx context.Context, batchID int64) error {
 func (s *Service) ListPublicity(ctx context.Context) ([]domain.Publicity, error) {
 	rows, err := s.DB.Query(ctx, `
 		SELECT id, batch_id, batch_no, store_name, charity_name, category, boxes,
-		       distributed_boxes, recipient_summary, status, published_at
+		       distributed_boxes, written_off_boxes, recipient_summary, status, published_at
 		FROM publicity ORDER BY id DESC LIMIT 200`)
 	if err != nil {
 		return nil, err
@@ -88,7 +91,8 @@ func (s *Service) ListPublicity(ctx context.Context) ([]domain.Publicity, error)
 		var p domain.Publicity
 		var summary []byte
 		if err := rows.Scan(&p.ID, &p.BatchID, &p.BatchNo, &p.StoreName, &p.CharityName,
-			&p.Category, &p.Boxes, &p.DistributedBoxes, &summary, &p.Status, &p.PublishedAt); err != nil {
+			&p.Category, &p.Boxes, &p.DistributedBoxes, &p.WrittenOffBoxes, &summary,
+			&p.Status, &p.PublishedAt); err != nil {
 			return nil, err
 		}
 		p.RecipientSummary = []domain.RecipientSum{}

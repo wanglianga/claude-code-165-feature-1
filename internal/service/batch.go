@@ -90,14 +90,18 @@ func (s *Service) ReportBatch(ctx context.Context, u *domain.User, storeID int64
 		}
 		for i := 1; i <= in.TotalBoxes; i++ {
 			boxNo := fmt.Sprintf("%s-BOX-%03d", batchNo, i)
-			var boxID int64
-			var createdAt time.Time
+			var box domain.Box
 			if err := tx.QueryRow(ctx, `
-				INSERT INTO boxes(batch_id, box_no) VALUES($1,$2) RETURNING id, created_at`,
-				id, boxNo).Scan(&boxID, &createdAt); err != nil {
+				INSERT INTO boxes(batch_id, box_no, produced_at) VALUES($1,$2,$3)
+				RETURNING id, expedited, created_at`,
+				id, boxNo, in.ProducedAt).Scan(&box.ID, &box.Expedited, &box.CreatedAt); err != nil {
 				return err
 			}
-			boxes = append(boxes, domain.Box{ID: boxID, BatchID: id, BoxNo: boxNo, Status: domain.BoxPending, CreatedAt: createdAt})
+			box.BatchID = id
+			box.BoxNo = boxNo
+			box.Status = domain.BoxPending
+			box.ProducedAt = in.ProducedAt
+			boxes = append(boxes, box)
 		}
 		if err := insertVoucher(ctx, tx, id, nil, domain.VoucherSource, map[string]any{
 			"batch_no": batchNo, "store_id": storeID, "category": in.Category,
@@ -226,7 +230,8 @@ func (s *Service) GetBatchDetail(ctx context.Context, batchID int64) (*domain.Ba
 
 func (s *Service) listBoxes(ctx context.Context, batchID int64) ([]domain.Box, error) {
 	rows, err := s.DB.Query(ctx,
-		`SELECT id, batch_id, box_no, status, created_at FROM boxes WHERE batch_id=$1 ORDER BY id`, batchID)
+		`SELECT id, batch_id, box_no, status, expedited, produced_at, created_at
+		 FROM boxes WHERE batch_id=$1 ORDER BY id`, batchID)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +239,8 @@ func (s *Service) listBoxes(ctx context.Context, batchID int64) ([]domain.Box, e
 	var out []domain.Box
 	for rows.Next() {
 		var b domain.Box
-		if err := rows.Scan(&b.ID, &b.BatchID, &b.BoxNo, &b.Status, &b.CreatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.BatchID, &b.BoxNo, &b.Status, &b.Expedited,
+			&b.ProducedAt, &b.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, b)

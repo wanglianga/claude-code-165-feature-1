@@ -127,8 +127,11 @@ func (s *Service) ScanBox(ctx context.Context, u *domain.User, resvID int64, box
 			return err
 		}
 		if boxStatus != domain.BoxPending {
-			scan, err = s.insertScan(ctx, tx, handoverID, &boxID, boxNo, "duplicate", tempC, sealIntact,
-				"该箱已扫描，请勿重复交接")
+			msg := "该箱已扫描，请勿重复交接"
+			if boxStatus == domain.BoxWrittenOff {
+				msg = fmt.Sprintf("箱 %s 已因冷链迟到降级判定为报损，不参与交接，请门店上传销毁凭证", boxNo)
+			}
+			scan, err = s.insertScan(ctx, tx, handoverID, &boxID, boxNo, "duplicate", tempC, sealIntact, msg)
 			return err
 		}
 		// 温度校验：冷链批次超标记录 temp_breach 异常（仍允许交接，由监管与机构追踪）
@@ -203,6 +206,19 @@ func (s *Service) CompleteHandover(ctx context.Context, u *domain.User, resvID i
 		if pending > 0 {
 			return domain.ErrUnprocessable(fmt.Sprintf("仍有 %d 箱未扫码核对，不能完成交接", pending))
 		}
+		// 冷链迟到降级报损的箱：完成交接前必须上传销毁照片或内部处理记录
+		var missingEvidence int
+		if err := tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM boxes bx
+			WHERE bx.batch_id=$1 AND bx.status='written_off'
+			  AND NOT EXISTS (SELECT 1 FROM box_disposals d WHERE d.box_id=bx.id)`, b.ID).
+			Scan(&missingEvidence); err != nil {
+			return err
+		}
+		if missingEvidence > 0 {
+			return domain.ErrUnprocessable(fmt.Sprintf(
+				"有 %d 个报损箱尚未上传销毁照片或内部处理记录，补齐凭证后方可完成交接", missingEvidence))
+		}
 		// 接收人身份核验：预约时登记了接收人则必须一致
 		verified := true
 		if r.ReceiverIDNo != "" && r.ReceiverIDNo != receiverIDNo {
@@ -238,6 +254,14 @@ func (s *Service) CompleteHandover(ctx context.Context, u *domain.User, resvID i
 			domain.BoxHandedOver, b.ID, domain.BoxScanned); err != nil {
 			return err
 		}
+		// 实际交接箱数 = 已交接箱；降级报损箱不进入公益流向
+		var handedCount, writtenOffCount int
+		if err := tx.QueryRow(ctx,
+			`SELECT COUNT(*) FILTER (WHERE status='handed_over'),
+			        COUNT(*) FILTER (WHERE status='written_off')
+			 FROM boxes WHERE batch_id=$1`, b.ID).Scan(&handedCount, &writtenOffCount); err != nil {
+			return err
+		}
 		if err := transitionBatch(ctx, tx, b.ID, domain.BatchHandover, domain.BatchHandedOver); err != nil {
 			return err
 		}
@@ -245,12 +269,15 @@ func (s *Service) CompleteHandover(ctx context.Context, u *domain.User, resvID i
 			"handover_id": handoverID, "reservation_no": r.ReservationNo,
 			"overall_temp_c": overallTempC, "seal_intact": *sealIntact,
 			"receiver_name": receiverName, "receiver_id_no": receiverIDNo,
-			"receiver_verified": verified, "store_staff_id": u.ID, "boxes": b.TotalBoxes,
+			"receiver_verified": verified, "store_staff_id": u.ID,
+			"boxes": handedCount, "total_boxes": b.TotalBoxes,
+			"written_off_boxes": writtenOffCount,
 		}); err != nil {
 			return err
 		}
 		if err := insertOutbox(ctx, tx, s.Cfg.KafkaTopic, fmt.Sprintf("batch:%d", b.ID), "batch.handed_over", map[string]any{
 			"batch_id": b.ID, "reservation_id": resvID, "handover_id": handoverID,
+			"handed_boxes": handedCount, "written_off_boxes": writtenOffCount,
 		}); err != nil {
 			return err
 		}

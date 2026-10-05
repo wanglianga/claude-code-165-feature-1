@@ -377,8 +377,9 @@ func (h *Handler) SubmitDeliveryPlan(c *gin.Context) {
 }
 
 type completeStopReq struct {
-	Boxes        int    `json:"boxes" binding:"required"`
-	ReceiverSign string `json:"receiver_sign" binding:"required"`
+	Boxes             int        `json:"boxes" binding:"required"`
+	ReceiverSign      string     `json:"receiver_sign" binding:"required"`
+	ActualDeliveredAt *time.Time `json:"actual_delivered_at"`
 }
 
 func (h *Handler) CompleteStop(c *gin.Context) {
@@ -391,7 +392,8 @@ func (h *Handler) CompleteStop(c *gin.Context) {
 		writeError(c, domain.ErrBadRequest("boxes 与 receiver_sign 必填"))
 		return
 	}
-	dist, finished, err := h.svc.CompleteStop(c.Request.Context(), currentUser(c), id, req.Boxes, req.ReceiverSign)
+	dist, finished, err := h.svc.CompleteStop(c.Request.Context(), currentUser(c), id,
+		req.Boxes, req.ReceiverSign, req.ActualDeliveredAt)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -495,6 +497,128 @@ func (h *Handler) ListExceptions(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"exceptions": list})
+}
+
+// ---------- 冷链迟到降级 ----------
+
+type degradeBoxReq struct {
+	BoxNo           string   `json:"box_no"`
+	ProducedAt      *string  `json:"produced_at"`
+	RemainingDistKm *float64 `json:"remaining_dist_km"`
+}
+
+type degradeReq struct {
+	SiteTempC       float64         `json:"site_temp_c" binding:"required"`
+	RemainingDistKm float64         `json:"remaining_dist_km"`
+	Note            string          `json:"note"`
+	Boxes           []degradeBoxReq `json:"boxes"`
+}
+
+func (h *Handler) Degrade(c *gin.Context) {
+	batchID, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	var req degradeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, domain.ErrBadRequest("site_temp_c 必填: "+err.Error()))
+		return
+	}
+	boxes := make([]service.DegradeBoxInput, 0, len(req.Boxes))
+	for _, b := range req.Boxes {
+		boxes = append(boxes, service.DegradeBoxInput{
+			BoxNo: b.BoxNo, ProducedAt: b.ProducedAt, RemainingDistKm: b.RemainingDistKm,
+		})
+	}
+	deg, idempotent, err := h.svc.DegradeTruckLate(c.Request.Context(), currentUser(c), batchID, service.DegradeInput{
+		SiteTempC: req.SiteTempC, RemainingDistKm: req.RemainingDistKm, Note: req.Note, Boxes: boxes,
+	})
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	status := 201
+	if idempotent {
+		status = 200
+	}
+	c.JSON(status, gin.H{"degradation": deg, "idempotent_replay": idempotent})
+}
+
+func (h *Handler) GetDegradation(c *gin.Context) {
+	batchID, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	deg, err := h.svc.GetDegradation(c.Request.Context(), currentUser(c), batchID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"degradation": deg})
+}
+
+type disposalReq struct {
+	BoxNo        string `json:"box_no" binding:"required"`
+	EvidenceType string `json:"evidence_type" binding:"required"`
+	EvidenceRef  string `json:"evidence_ref" binding:"required"`
+	Note         string `json:"note"`
+}
+
+func (h *Handler) UploadDisposal(c *gin.Context) {
+	batchID, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	var req disposalReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, domain.ErrBadRequest("box_no/evidence_type/evidence_ref 必填"))
+		return
+	}
+	d, err := h.svc.UploadDisposalEvidence(c.Request.Context(), currentUser(c), batchID,
+		req.BoxNo, req.EvidenceType, req.EvidenceRef, req.Note)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(201, gin.H{"disposal": d})
+}
+
+func (h *Handler) ListDisposals(c *gin.Context) {
+	batchID, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	list, err := h.svc.ListDisposals(c.Request.Context(), batchID)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"disposals": list})
+}
+
+// ---------- 通知 ----------
+
+func (h *Handler) ListNotifications(c *gin.Context) {
+	onlyUnread := c.Query("unread") == "true" || c.Query("unread") == "1"
+	list, err := h.svc.ListNotifications(c.Request.Context(), currentUser(c), onlyUnread)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"notifications": list})
+}
+
+func (h *Handler) ReadNotification(c *gin.Context) {
+	id, ok := parseID(c, "id")
+	if !ok {
+		return
+	}
+	n, err := h.svc.MarkNotificationRead(c.Request.Context(), currentUser(c), id)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"notification": n})
 }
 
 // ---------- 凭证 / 审计 / 公示 ----------

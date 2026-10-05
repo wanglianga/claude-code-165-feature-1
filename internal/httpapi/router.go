@@ -84,6 +84,19 @@ func NewRouter(svc *service.Service, openapiYAML []byte) *gin.Engine {
 		authed.POST("/distributions/:id/feedback",
 			RequireRoles(domain.RoleCharityStaff, domain.RoleRegulator), h.SubmitFeedback)
 
+		// 冷链迟到降级
+		authed.POST("/batches/:id/degradation",
+			RequireRoles(domain.RoleCharityStaff), h.Degrade)
+		authed.GET("/batches/:id/degradation", h.GetDegradation)
+		authed.POST("/batches/:id/disposals",
+			RequireRoles(domain.RoleStoreStaff, domain.RoleStoreManager), h.UploadDisposal)
+		authed.GET("/batches/:id/disposals", h.ListDisposals)
+
+		// 降级通知（机构 / 监管）
+		authed.GET("/notifications", h.ListNotifications)
+		authed.POST("/notifications/:id/read",
+			RequireRoles(domain.RoleCharityStaff), h.ReadNotification)
+
 		// 异常
 		authed.GET("/exceptions", h.ListExceptions)
 		authed.POST("/exceptions/:id/resolve", h.ResolveException)

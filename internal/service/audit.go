@@ -52,6 +52,12 @@ func (s *Service) AuditTrail(ctx context.Context, batchID int64) (map[string]any
 		"chain_valid": domain.VerifyChain(vouchers),
 		"exceptions":  exceptions,
 	}
+	if deg, err := s.getDegradation(ctx, s.DB, batchID); err == nil {
+		result["degradation"] = deg
+		if disposals, derr := s.ListDisposals(ctx, batchID); derr == nil {
+			result["disposals"] = disposals
+		}
+	}
 	if resv != nil {
 		if scans, err := s.ListScans(ctx, resv.ID); err == nil {
 			result["handover_scans"] = scans

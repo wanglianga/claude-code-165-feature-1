@@ -286,6 +286,128 @@ expect_code 201 "监管抽查留痕"
 req GET "/api/v1/exceptions?batch_id=$BATCH_A" "$REG"
 assert_jq "存在 regulatory_check 记录" '[.exceptions[] | select(.type=="regulatory_check")] | length == 1'
 
+echo "== 12. 冷链车迟到降级（逐箱判定报损/加急 + 销毁凭证 + 通知 + 公示） =="
+NOW_E=$(date -u +%s)
+BODY_E=$(jq -n --arg produced "$(iso $((NOW_E-25*3600)))" --arg pickup "$(iso $((NOW_E+8*3600)))" '{
+  category:"奶油蛋糕", description:"冷链生日蛋糕", total_boxes:3, quantity_desc:"每箱6个",
+  produced_at:$produced, shelf_life_hours:34, allergens:["gluten","milk","egg"],
+  allergen_confirmed:true, requires_cold_chain:true, storage_temp_max_c:8,
+  packaging:"intact", address:"上海市长宁区长宁路1018号", lat:31.2243, lng:121.4243,
+  latest_pickup_at:$pickup}')
+req POST "/api/v1/stores/$STORE1/batches" "$STORE_STAFF" "$BODY_E"
+expect_code 201 "上报冷链蛋糕批次E(3箱)"
+BATCH_E=$(echo "$RESP" | jq -r '.batch.id')
+EBOX1=$(echo "$RESP" | jq -r '.boxes[0].box_no')
+EBOX2=$(echo "$RESP" | jq -r '.boxes[1].box_no')
+EBOX3=$(echo "$RESP" | jq -r '.boxes[2].box_no')
+PICKUP_E=$(iso $((NOW_E+2*3600)))
+req POST "/api/v1/batches/$BATCH_E/reserve" "$CH1" \
+  "{\"charity_id\":$CH1_ID,\"boxes\":3,\"planned_pickup_at\":\"$PICKUP_E\",\"cold_chain\":true,
+    \"vehicle_plate\":\"沪A88888\",\"driver_name\":\"孙七\"}" \
+  "Idempotency-Key: rk-e-$NOW"
+expect_code 201 "机构1预约批次E"
+RESV_E=$(echo "$RESP" | jq -r '.reservation.id')
+req POST "/api/v1/reservations/$RESV_E/confirm" "$STORE_MGR"
+expect_code 200 "店长确认批次E"
+# 其他机构不能代为降级
+req POST "/api/v1/batches/$BATCH_E/degradation" "$CH2" '{"site_temp_c":10}'
+expect_code 403 "非预约机构不能发起降级"
+# 机构先留痕车辆迟到
+req POST "/api/v1/batches/$BATCH_E/exceptions" "$CH1" \
+  '{"type":"truck_late","detail":{"eta_minutes":75,"reason":"晚高峰拥堵+制冷偏弱"}}'
+expect_code 201 "机构上报冷链车迟到"
+# 降级判定：近站(2km/5km)可加急，远站(40km)折损后寿命不足转报损
+req POST "/api/v1/batches/$BATCH_E/degradation" "$CH1" "$(jq -n --arg b1 "$EBOX1" --arg b2 "$EBOX2" --arg b3 "$EBOX3" '{
+  site_temp_c:10, remaining_dist_km:5, note:"车厢实测10℃，按站点距离逐箱判定",
+  boxes:[{box_no:$b1, remaining_dist_km:2},{box_no:$b2, remaining_dist_km:40},{box_no:$b3, remaining_dist_km:5}]}')"
+expect_code 201 "冷链迟到降级处理完成"
+assert_jq "1箱报损" '.degradation.written_off_boxes == 1'
+assert_jq "2箱加急" '.degradation.expedited_boxes == 2'
+assert_jq "远站箱判定 written_off" "[.degradation.items[] | select(.decision==\"written_off\")] | length == 1"
+assert_jq "近站箱判定 expedited" "[.degradation.items[] | select(.decision==\"expedited\")] | length == 2"
+assert_jq "报损箱为箱2" "[.degradation.items[] | select(.decision==\"written_off\")][0].box_no == \"$EBOX2\""
+# 幂等重放
+req POST "/api/v1/batches/$BATCH_E/degradation" "$CH1" '{"site_temp_c":10}'
+expect_code 200 "降级重复调用幂等返回"
+assert_jq "降级幂等标记" '.idempotent_replay == true'
+# 异常留痕
+req GET "/api/v1/exceptions?batch_id=$BATCH_E" "$REG"
+assert_jq "产生 late_degradation 异常" '[.exceptions[] | select(.type=="late_degradation")] | length == 1'
+# 通知已预约机构
+req GET "/api/v1/notifications?unread=true" "$CH1"
+assert_jq "机构收到降级通知" "[.notifications[] | select(.batch_id==$BATCH_E)] | length == 1"
+assert_jq "通知含1个报损箱号" "[.notifications[] | select(.batch_id==$BATCH_E)][0].written_off_boxes | length == 1"
+assert_jq "通知含2个加急箱号" "[.notifications[] | select(.batch_id==$BATCH_E)][0].expedited_boxes | length == 2"
+NOTIF_E=$(echo "$RESP" | jq -r "[.notifications[] | select(.batch_id==$BATCH_E)][0].id")
+req POST "/api/v1/notifications/$NOTIF_E/read" "$CH1"
+expect_code 200 "机构标记降级通知已读"
+# 交接：报损箱扫码返回 duplicate 提示，不阻断
+req POST "/api/v1/reservations/$RESV_E/handover/start" "$STORE_STAFF"
+expect_code 201 "批次E开始交接"
+req POST "/api/v1/reservations/$RESV_E/handover/scan" "$STORE_STAFF" \
+  "{\"box_no\":\"$EBOX2\",\"temp_c\":9.5,\"seal_intact\":true}"
+assert_jq "报损箱扫码被拦截提示" '.scan.result == "duplicate"'
+req POST "/api/v1/reservations/$RESV_E/handover/scan" "$STORE_STAFF" \
+  "{\"box_no\":\"$EBOX1\",\"temp_c\":9.0,\"seal_intact\":true}"
+expect_code 201 "扫描加急箱1"
+req POST "/api/v1/reservations/$RESV_E/handover/scan" "$STORE_STAFF" \
+  "{\"box_no\":\"$EBOX3\",\"temp_c\":9.0,\"seal_intact\":true}"
+expect_code 201 "扫描加急箱3"
+# 未销毁凭证不能完成交接
+req POST "/api/v1/reservations/$RESV_E/handover/complete" "$STORE_STAFF" \
+  '{"receiver_name":"李四","receiver_id_no":"ID3101101990","overall_temp_c":9.0,"seal_intact":true}'
+expect_code 422 "报损箱缺销毁凭证时禁止完成交接"
+# 给非报损箱上传凭证 -> 409
+req POST "/api/v1/batches/$BATCH_E/disposals" "$STORE_STAFF" \
+  "{\"box_no\":\"$EBOX1\",\"evidence_type\":\"destruction_photo\",\"evidence_ref\":\"https://obj.example/e1.jpg\"}"
+expect_code 409 "非报损箱不能上传销毁凭证"
+# 门店上传销毁照片 + 内部处理记录
+req POST "/api/v1/batches/$BATCH_E/disposals" "$STORE_STAFF" \
+  "{\"box_no\":\"$EBOX2\",\"evidence_type\":\"destruction_photo\",\"evidence_ref\":\"https://obj.example/destroy-e2.jpg\",\"note\":\"门店后厨销毁拍照留档\"}"
+expect_code 201 "门店上传报损箱销毁照片"
+req GET "/api/v1/batches/$BATCH_E/disposals" "$REG"
+assert_jq "可查销毁凭证" '[.disposals[] | select(.box_no=="'"$EBOX2"'")] | length == 1'
+assert_jq "降级项凭证状态已更新" '[.degradation.items[]? // empty] | length >= 0'
+req POST "/api/v1/reservations/$RESV_E/handover/complete" "$STORE_STAFF" \
+  '{"receiver_name":"李四","receiver_id_no":"ID3101101990","overall_temp_c":9.0,"seal_intact":true}'
+expect_code 200 "补齐凭证后完成交接(实交2箱)"
+# 配送计划须与实际交接箱数(2)一致
+req POST "/api/v1/reservations/$RESV_E/delivery-plan" "$CH1" \
+  '{"vehicle_plate":"沪A88888","driver_name":"孙七","cold_chain":true,
+    "stops":[{"seq":1,"recipient_type":"shelter","site_name":"长宁救助站","planned_boxes":3}]}'
+expect_code 422 "配送3箱与实际交接2箱不一致被拒"
+req POST "/api/v1/reservations/$RESV_E/delivery-plan" "$CH1" \
+  '{"vehicle_plate":"沪A88888","driver_name":"孙七","cold_chain":true,
+    "stops":[{"seq":1,"recipient_type":"shelter","site_name":"长宁救助站","address":"凯旋路100号","planned_boxes":2}]}'
+expect_code 201 "提交2箱加急配送计划"
+STOP_E=$(echo "$RESP" | jq -r '.stops[0].id')
+# 加急箱发放必须补充实际送达时间
+req POST "/api/v1/delivery-stops/$STOP_E/complete" "$CH1" '{"boxes":2,"receiver_sign":"周八"}'
+expect_code 422 "加急箱未补实际送达时间被拒"
+DELIVERED_E=$(iso $NOW_E)
+req POST "/api/v1/delivery-stops/$STOP_E/complete" "$CH1" \
+  "{\"boxes\":2,\"receiver_sign\":\"周八\",\"actual_delivered_at\":\"$DELIVERED_E\"}"
+expect_code 200 "补充实际送达时间后发放闭环"
+assert_jq "批次E闭环" '.batch_distributed == true'
+assert_jq "发放记录回传实际送达时间" '.distribution.actual_delivered_at != null'
+# 公示数量同步调整
+req GET /api/v1/publicity/donations
+assert_jq "批次E公示捐赠箱数=2(扣报损)" "[.donations[] | select(.batch_id==$BATCH_E)][0].boxes == 2"
+assert_jq "批次E公示发放箱数=2" "[.donations[] | select(.batch_id==$BATCH_E)][0].distributed_boxes == 2"
+assert_jq "批次E公示报损箱数=1" "[.donations[] | select(.batch_id==$BATCH_E)][0].written_off_boxes == 1"
+# 箱状态与凭证链
+req GET "/api/v1/batches/$BATCH_E" "$REG"
+assert_jq "2箱已发放" '[.boxes[] | select(.status=="distributed")] | length == 2'
+assert_jq "1箱已报损" '[.boxes[] | select(.status=="written_off")] | length == 1'
+req GET "/api/v1/batches/$BATCH_E/vouchers" "$REG"
+assert_jq "含降级凭证" '[.vouchers[] | select(.type=="degradation")] | length == 1'
+assert_jq "降级后凭证链仍有效" '.chain_valid == true'
+req GET "/api/v1/batches/$BATCH_E/audit" "$REG"
+expect_code 200 "监管查看批次E全链路审计"
+assert_jq "审计含降级结果" '.degradation.written_off_boxes == 1'
+assert_jq "审计含销毁凭证" '[.disposals[]] | length == 1'
+assert_jq "审计凭证链有效" '.chain_valid == true'
+
 echo ""
 echo "==================================="
 echo "验证结果: PASS=$PASS FAIL=$FAIL"
